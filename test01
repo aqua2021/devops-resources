@@ -1,0 +1,12 @@
+#!/bin/bash
+
+dir = "documents/downloads/test01"
+if [ -e $dir ]
+
+then
+    
+echo " $dir "
+
+fi
+
+
