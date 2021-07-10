@@ -6,3 +6,4 @@ read name
 
 Echo "welcome $name you are awsome"
 "
+# test git commit
