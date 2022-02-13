@@ -1,0 +1,352 @@
+Create an S3 bucket in Account A
+Create an IAM role or user in Account B
+##############################################################
+s3.tf Account A
+#####################################
+resource "aws_s3_bucket" "ec2_bucket" {
+  bucket = "sirri-ec2-bucket"
+  acl    = "private"
+  versioning {
+         enabled = true
+  }
+}
+
+resource "aws_s3_bucket_policy" "allow_access_from_another_account" {
+  bucket = aws_s3_bucket.ec2_bucket.id
+  policy = data.aws_iam_policy_document.allow_access_from_another_account.json
+}
+
+data "aws_iam_policy_document" "allow_access_from_another_account" {
+  statement {
+    principals {
+      type        = "AWS"
+      identifiers = [AccountB] 
+    }
+
+    actions = [
+      "s3:GetObject",
+      "s3:PutObject",
+      "s3:ListBucket",
+    ]
+
+    resources = [
+      aws_s3_bucket.ec2_bucket.arn,
+      "${aws_s3_bucket.ec2_bucket.arn}/*",
+    ]
+  }
+}
+##############################################################
+iam.tf created in Account B
+#############################################################
+
+resource "aws_iam_instance_profile" "ec2_profile" {
+  name = "ec2_profile"
+  role = aws_iam_role.ec2_role.name
+}
+
+resource "aws_iam_role" "ec2_role" {
+  name = "ec2_role"
+
+  assume_role_policy = <<EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Action": "sts:AssumeRole",
+            "Principal": {
+               "Service": "ec2.amazonaws.com"
+            },
+            "Effect": "Allow",
+            "Sid": ""
+        }
+    ]
+}
+EOF
+}
+
+resource "aws_iam_role_policy" "ec2_policy" {
+  name = "ec2_policy"
+  role = aws_iam_role.ec2_role.id
+  policy = <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::AccountAsirri-ec2-bucket"]
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": ["arn:aws:s3:::AccountAsirri-ec2-bucket/*"]
+    }
+  ]
+}
+EOF
+}
+
+
+##############################################
+main.tf Account B
+##############################################
+
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 3.0"
+    }
+  }
+}
+
+provider "aws" {
+  region     = var.region
+}
+# Declare the data source for availablity zone depending on region specified
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+#create VPC
+resource "aws_vpc" "main" {
+  cidr_block           = var.cidr
+  instance_tenancy     = "default"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = {
+    Name = "main"
+    #  "kubernetes.io/cluster/${var.cluster_name}"  = "shared"
+  }
+}
+#create public and private subnets
+resource "aws_subnet" "public" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = var.public_subnet
+  availability_zone       = data.aws_availability_zones.available.names[0]
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name = "Public subnet"
+    #  "kubernetes.io/cluster/${var.cluster_name}"  = "shared"
+    #  "kubernetes.io/role/elb"                     = "1"
+
+  }
+}
+
+resource "aws_subnet" "private" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = var.private_subnet
+  availability_zone = data.aws_availability_zones.available.names[1]
+
+  tags = {
+    Name = "Private subnet"
+    #"kubernetes.io/cluster/${var.cluster_name}"  = "shared"
+    #  "kubernetes.io/role/internal-elb"            = "1"
+  }
+}
+
+#internet gate way
+resource "aws_internet_gateway" "gw" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name = "mainGW"
+  }
+}
+
+#elastic ip for nat gateway
+resource "aws_eip" "nat_eip" {
+  vpc        = true
+  depends_on = [aws_internet_gateway.gw]
+
+  tags = {
+    Name = "NAT Gateway EIP"
+  }
+}
+
+}
+# Nat gate way
+resource "aws_nat_gateway" "nat" {
+  allocation_id = aws_eip.nat_eip.id
+  subnet_id     = aws_subnet.public.id
+
+  tags = {
+    Name = "Main Nat Gateway"
+  }
+}
+
+#Route Table for Public Subnet
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.gw.id
+  }
+
+  tags = {
+    Name = "Public Route table"
+  }
+}
+#Associate between public and private Route table
+resource "aws_route_table_association" "public" {
+  subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.public.id
+}
+#Route Table for Private Subnet
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_nat_gateway.nat.id
+  }
+
+  tags = {
+    Name = "Private Route table"
+  }
+}
+
+#Associate between public and private Route table
+resource "aws_route_table_association" "private" {
+  subnet_id      = aws_subnet.private.id
+  route_table_id = aws_route_table.private.id
+}
+
+
+###########################################################################
+# create a security group
+###########################################################################
+resource "aws_security_group" "allow_tls" {
+
+  name        = "appDMZ"
+  description = "Allow TLS inbound traffic"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port   = var.ssh_port
+    to_port     = var.ssh_port
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port   = 8080
+    to_port     = 8080
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "allow_tls"
+  }
+}
+
+######################################################################################
+# create an instance
+######################################################################################
+data "aws_ami" "ubuntu" {
+  most_recent = true
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-focal-20.04-amd64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+
+  owners = ["099720109477"] # Canonical
+}
+
+resource "aws_instance" "web" {
+  ami = data.aws_ami.ubuntu.id
+  #count         = var.instance_count
+  instance_type   = var.instance_type
+  key_name        = var.key_name
+  subnet_id       = aws_subnet.private.id
+  security_groups = ["${aws_security_group.allow_tls.id}"]
+  iam_instance_profile = "${aws_iam_instance_profile.ec2_profile.id}"     
+
+  tags = {
+    Name = "nodeapp"
+  }
+
+}
+
+#######################################
+variable.tf Account B
+######################################
+variable "region" {
+  type        = string
+  description = "Region to launch vpc"
+  default     = "us.east.1"
+}
+variable "cidr" {
+  type        = string
+  description = "The CIDR of the VPC."
+}
+
+variable "public_subnet" {
+  type        = string
+  description = "The public subnet to create."
+}
+variable "private_subnet" {
+  type        = string
+  description = "The public subnet to create."
+}
+
+/*variable "instance_count" {
+    type = number
+    description = "number of instances to launch"
+}*/
+variable "instance_type" {
+  type        = string
+  description = "The type of instance to launch"
+}
+variable "key_name" {
+  type        = string
+  description = "Key used to connect to instance generated"
+}
+#######################################
+terraform.tfvars Account B
+#######################################
+region          = "us-east-2"
+cidr            = "10.0.0.0/16"
+public_subnet   = "10.0.1.0/24"
+private_subnet  = "10.0.2.0/24"
+public1_subnet  = "10.0.32.0/24"
+private1_subnet = "10.0.192.0/24"
+#instance_count = 1
+instance_type = "t2.medium"
+######################################
+
+
